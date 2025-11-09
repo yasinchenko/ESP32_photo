@@ -1,0 +1,105 @@
+# === PlatformIO проект: структура и конфиги ===
+
+# Дерево проекта (минимум)
+#
+#  your-project/
+#  ├─ platformio.ini
+#  ├─ src/
+#  │   ├─ main.cpp                # можно взять из каркаса на канвасе
+#  │   └─ (остальные .h/.cpp из каркаса: /hw, /control, /vision, /tasks, /storage, /utils)
+#  ├─ include/                    # .h (по желанию)
+#  ├─ data/                       # SPIFFS/LittleFS (необязательно)
+#  ├─ lib/                        # локальные библиотеки (если появятся)
+#  └─ partitions.csv              # опциональный кастом (см. ниже)
+
+# ------------------------------------------------
+# platformio.ini — два профиля (debug/release)
+# ------------------------------------------------
+[platformio]
+default_envs = esp32cam-debug
+
+[env]
+platform = espressif32
+board = esp32cam              ; AI Thinker ESP32-CAM
+framework = arduino
+monitor_speed = 115200
+monitor_filters = 
+  esp32_exception_decoder
+  time
+build_unflags = -Os
+lib_deps =
+  ; сюда можно добавлять библиотеки по мере надобности
+  ; к примеру, библиотека журнала или математика
+
+board_build.partitions = huge_app.csv   ; стандартный расширенный раздел (входит в пакет платформы)
+
+; Общие флаги для всех профилей
+build_flags =
+  -D ARDUINO_USB_MODE=0
+  -D BOARD_HAS_PSRAM
+  -mfix-esp32-psram-cache-issue
+  -D CORE_DEBUG_LEVEL=1          ; 0–5
+  ; -D USE_ESP_FACE              ; включить, если интегрируешь ESP-WHO/esp-face вручную
+
+upload_speed = 921600
+
+; Если нужен OTA, можно добавить профиль с upload_protocol = espota позже
+
+[env:esp32cam-debug]
+build_type = debug
+
+[env:esp32cam-release]
+build_type = release
+build_flags =
+  ${env.build_flags}
+  -D NDEBUG
+
+# ------------------------------------------------
+# Пример кастомного разделения памяти (опционально)
+# Сохрани как partitions.csv и укажи его в board_build.partitions
+# ------------------------------------------------
+; Name,   Type, SubType, Offset,  Size,    Flags
+; nvs,    data, nvs,     0x9000,  0x5000,
+; otadata,data, ota,     0xe000,  0x2000,
+; app0,   app,  ota_0,   0x10000, 0x190000,
+; app1,   app,  ota_1,   0x1A0000,0x190000,
+; spiffs, data, spiffs,  0x330000,0x0D0000,
+
+# === Шаги запуска ===
+# 1) Установи VS Code + расширение PlatformIO.
+# 2) Создай пустую папку проекта → PIO Home → New Project → Board: esp32cam → Framework: Arduino.
+# 3) Замени сгенерированный platformio.ini на этот.
+# 4) Вложи исходники из каркаса (на соседнем канвасе) в каталог src/ (сохрани структуру /hw, /control, /vision, /tasks, /storage, /utils, файлы pins.h, app_config.h и т.п.).
+# 5) Открой порт: см. «PIO: Serial Monitor» (после прошивки).
+# 6) Команды: Build, Upload, Monitor — доступны снизу в статус-баре PIO.
+
+# === Настройки пинов камеры (важно) ===
+# В main.cpp используем конфиг для AI Thinker (как в каркасе). Если у тебя другой модуль — замени маппинг.
+
+# === Замечания по железу ESP32-CAM ===
+# • Питание 5V/1A, на момент прошивки лучше отключить потребителей (моторный драйвер, LED-вспышка).
+# • Если драйвер моторов сидит на IO1/IO3 (UART), на время прошивки отключай его (или ставь джамперы/резисторы).
+# • Для входа в загрузчик замкни IO0 на GND и нажми RESET (если нет авто-boot).
+
+# === Отладка/логи ===
+# • Включи more logs: подними CORE_DEBUG_LEVEL до 3..5, тогда Serial покажет больше из Arduino core.
+# • Фильтр esp32_exception_decoder позволит увидеть stacktrace в человеко-читаемом виде.
+
+# === ESP-WHO / esp-face (по желанию) ===
+# • В Arduino+PlatformIO готового пакета ESP-WHO нет «из коробки». Варианты:
+#   1) Перейти на «ESP-IDF + Arduino as component» и подключить ESP-WHO как компонент.
+#   2) Вручную добавить нужные части ESP-WHO в lib/ и собрать (потребует CMake→PIO адаптации, не всегда тривиально).
+# • Пока можно оставить -D USE_ESP_FACE закомментированным: работает заглушка face_detect().
+
+# === OTA профиль (пример, опционально) ===
+; [env:esp32cam-ota]
+; extends = env:esp32cam-release
+; upload_protocol = espota
+; upload_port = 192.168.1.123         ; IP твоей ESP32-CAM
+; upload_flags =
+;   --port=3232
+;   --auth=your_ota_password
+
+# === Подсказки по PWM ===
+# На ESP32 точнее использовать ledcWrite/ledcSetup/ledcAttachPin вместо analogWrite. 
+# В каркасе можно быстро заменить реализацию PWM в hw/motors.* и hw/led_flash.* на ledc.* для стабильности.

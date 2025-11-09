@@ -1,0 +1,606 @@
+// =========================
+// Project: Autonomous Photo Robot (ESP32-CAM)
+// IDE: Arduino IDE 2.x
+// Board: AI Thinker ESP32-CAM (PSRAM Enabled)
+// =========================
+// Структура виртуальных файлов внутри этого одного документа:
+//  - /src/main.cpp
+//  - /src/pins.h
+//  - /src/app_config.h
+//  - /src/types.h
+//  - /src/utils/logger.h
+//  - /src/hw/hcsr04.h, /src/hw/hcsr04.cpp
+//  - /src/hw/motors.h, /src/hw/motors.cpp
+//  - /src/hw/led_flash.h, /src/hw/led_flash.cpp
+//  - /src/storage/sd_writer.h, /src/storage/sd_writer.cpp
+//  - /src/vision/frame_diff.h, /src/vision/frame_diff.cpp
+//  - /src/vision/face_detect.h, /src/vision/face_detect.cpp
+//  - /src/control/motion.h, /src/control/motion.cpp
+//  - /src/control/wall_follow.h, /src/control/wall_follow.cpp
+//  - /src/tasks/tasks.h, /src/tasks/tasks.cpp
+// -------------------------
+// Копируйте содержимое каждого логического файла в отдельные файлы в вашем проекте.
+
+// =========================
+// /src/pins.h
+// =========================
+#pragma once
+#include <Arduino.h>
+
+namespace PINS {
+  // HC-SR04 (Front)
+  static constexpr uint8_t HCSR04F_ECHO = 4;   // IO4
+  static constexpr uint8_t HCSR04F_TRIG = 2;   // IO2
+  // HC-SR04 (Right)
+  static constexpr uint8_t HCSR04R_ECHO = 15;  // IO15
+  static constexpr uint8_t HCSR04R_TRIG = 16;  // IO16
+
+  // Motors (пример для драйвера HR8833; подправьте под своё подключение)
+  static constexpr uint8_t ML_IN1 = 13;
+  static constexpr uint8_t ML_IN2 = 14;
+  static constexpr uint8_t MR_IN1 = 3;   // предупреждение: IO3 на ESP32-CAM — U0RXD; проверьте разводку
+  static constexpr uint8_t MR_IN2 = 1;   // IO1 — U0TXD
+
+  // LED Flash
+  static constexpr uint8_t LED_FLASH = 12; // встроенная вспышка ESP32-CAM
+}
+
+// =========================
+// /src/app_config.h
+// =========================
+#pragma once
+#include <Arduino.h>
+
+namespace CFG {
+  // Дистанции (см)
+  static constexpr float FRONT_STOP_CM      = 30.0f;
+  static constexpr float RIGHT_TARGET_CM    = 21.0f;
+  static constexpr float RIGHT_DEADBAND_CM  = 2.5f;
+
+  // Скорости/тайминги
+  static constexpr uint8_t BASE_SPEED       = 170;     // 0..255 PWM
+  static constexpr uint8_t TURN_SPEED       = 160;
+  static constexpr uint8_t BACK_SPEED       = 160;
+  static constexpr uint32_t MOVE_SEG_MS     = 500;     // длительность сегмента прямого хода
+
+  // Антибукс
+  static constexpr uint32_t ANTISLIP_WINDOW_MS = 600;  // окно измерения «прогресса»
+  static constexpr float    ANTISLIP_EPS_CM    = 1.5f; // «почти нет изменений»
+  static constexpr uint32_t ANTISLIP_BACK_MS   = 350;
+  static constexpr uint32_t ANTISLIP_TURN_MS   = 420;
+
+  // Визия
+  static constexpr uint32_t FRAME_DIFF_DT_MS   = 150;
+  static constexpr float    FRAME_DIFF_THRESH  = 18.0f; // эмпирический порог
+
+  // Камера/SD
+  static constexpr bool SAVE_ANALYSIS_FRAMES   = false; // кадры анализа в /analysis
+}
+
+// =========================
+// /src/types.h
+// =========================
+#pragma once
+#include <Arduino.h>
+
+enum class MotionMode : uint8_t {
+  STOP = 0,
+  FWD,
+  BACK,
+  TURN_LEFT,
+  TURN_RIGHT
+};
+
+enum class State : uint8_t {
+  BOOT = 0,
+  SCAN_BEFORE_MOVE,
+  RANGE_AND_PLAN,
+  MOVE_SEGMENT,
+  SCAN_AFTER_MOVE,
+  ANTI_SLIP,
+  PHOTO
+};
+
+struct Ranges {
+  float dF_cm = NAN; // front
+  float dR_cm = NAN; // right
+  uint32_t ts_ms = 0;
+};
+
+// =========================
+// /src/utils/logger.h
+// =========================
+#pragma once
+#include <Arduino.h>
+
+namespace LOG {
+  inline void info(const char* m){ Serial.printf("[I] %s\n", m);} 
+  inline void warn(const char* m){ Serial.printf("[W] %s\n", m);} 
+  inline void err (const char* m){ Serial.printf("[E] %s\n", m);} 
+  template<typename... A>
+  inline void printf(const char* fmt, A... a){ Serial.printf(fmt, a...); }
+}
+
+// =========================
+// /src/hw/hcsr04.h
+// =========================
+#pragma once
+#include <Arduino.h>
+
+class HCSR04 {
+public:
+  HCSR04(uint8_t trig, uint8_t echo) : trig_(trig), echo_(echo) {}
+  void begin(){ pinMode(trig_, OUTPUT); pinMode(echo_, INPUT); digitalWrite(trig_, LOW);} 
+  float read_cm(uint16_t attempts = 3) const; // усреднение/медиана
+private:
+  uint8_t trig_, echo_;
+};
+
+// =========================
+// /src/hw/hcsr04.cpp
+// =========================
+#include "hcsr04.h"
+
+static float read_once_cm(uint8_t trig, uint8_t echo){
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  unsigned long duration = pulseIn(echo, HIGH, 30000UL); // 30ms ~ 5m
+  if(duration == 0) return NAN;
+  float distance_cm = duration * 0.0343f / 2.0f; // speed of sound ~343 m/s
+  return distance_cm;
+}
+
+float HCSR04::read_cm(uint16_t attempts) const {
+  // простая медиана для устойчивости
+  if(attempts < 1) attempts = 1;
+  float best = NAN;
+  for(uint16_t i=0; i<attempts; ++i){
+    float v = read_once_cm(trig_, echo_);
+    if(!isnan(v)){
+      if(isnan(best) || v < best) best = v; // возьмём минимальное как устойчивую оценку
+    }
+    delay(25); // анти-переотражение
+  }
+  return best;
+}
+
+// =========================
+// /src/hw/motors.h
+// =========================
+#pragma once
+#include <Arduino.h>
+#include "types.h"
+
+class Motors {
+public:
+  void begin(uint8_t ml_in1, uint8_t ml_in2, uint8_t mr_in1, uint8_t mr_in2);
+  void setMode(MotionMode mode, uint8_t speed=160);
+  MotionMode mode() const { return mode_; }
+private:
+  uint8_t L1_, L2_, R1_, R2_;
+  MotionMode mode_ = MotionMode::STOP;
+  void driveLR(int l, int r); // -255..255
+};
+
+// =========================
+// /src/hw/motors.cpp
+// =========================
+#include "motors.h"
+
+void Motors::begin(uint8_t ml_in1, uint8_t ml_in2, uint8_t mr_in1, uint8_t mr_in2){
+  L1_=ml_in1; L2_=ml_in2; R1_=mr_in1; R2_=mr_in2;
+  pinMode(L1_, OUTPUT); pinMode(L2_, OUTPUT);
+  pinMode(R1_, OUTPUT); pinMode(R2_, OUTPUT);
+  driveLR(0,0);
+}
+
+void Motors::driveLR(int l, int r){
+  l = constrain(l, -255, 255);
+  r = constrain(r, -255, 255);
+  // Простой двутакт через PWM; замените на ledcWrite при необходимости
+  if(l>=0){ analogWrite(L1_, l); analogWrite(L2_, 0); } else { analogWrite(L1_, 0); analogWrite(L2_, -l); }
+  if(r>=0){ analogWrite(R1_, r); analogWrite(R2_, 0); } else { analogWrite(R1_, 0); analogWrite(R2_, -r); }
+}
+
+void Motors::setMode(MotionMode m, uint8_t s){
+  mode_ = m;
+  switch(m){
+    case MotionMode::STOP:      driveLR(0,0); break;
+    case MotionMode::FWD:       driveLR(s, s); break;
+    case MotionMode::BACK:      driveLR(-s,-s); break;
+    case MotionMode::TURN_LEFT: driveLR(-s, s); break;
+    case MotionMode::TURN_RIGHT:driveLR( s,-s); break;
+  }
+}
+
+// =========================
+// /src/hw/led_flash.h
+// =========================
+#pragma once
+#include <Arduino.h>
+
+class LedFlash {
+public:
+  explicit LedFlash(uint8_t pin): pin_(pin){}
+  void begin(){ pinMode(pin_, OUTPUT); off(); }
+  void on(uint8_t pwm=255){ analogWrite(pin_, pwm); }
+  void off(){ analogWrite(pin_, 0); }
+private:
+  uint8_t pin_;
+};
+
+// =========================
+// /src/hw/led_flash.cpp
+// =========================
+#include "led_flash.h"
+
+// всё в header для простоты; отдельный cpp можно не использовать
+
+// =========================
+// /src/storage/sd_writer.h
+// =========================
+#pragma once
+#include <Arduino.h>
+#include <FS.h>
+#include <SD_MMC.h>
+
+namespace SDWR {
+  bool begin();
+  void end();
+  String makePath(bool people, const String& stamp);
+  bool saveJpeg(const uint8_t* buf, size_t len, bool toPeople, const String& stamp);
+}
+
+// =========================
+// /src/storage/sd_writer.cpp
+// =========================
+#include "sd_writer.h"
+
+bool SDWR::begin(){
+  // SD_MMC для ESP32-CAM
+  if(!SD_MMC.begin("/sdcard", true)) return false; // 1bit mode (true) обычно стабильнее
+  return true;
+}
+
+void SDWR::end(){ SD_MMC.end(); }
+
+String SDWR::makePath(bool people, const String& stamp){
+  String dir = people ? "/people" : "/analysis";
+  String path = dir + String("/") + stamp + String(".jpg");
+  // ensure dir
+  SD_MMC.mkdir(dir);
+  return path;
+}
+
+bool SDWR::saveJpeg(const uint8_t* buf, size_t len, bool toPeople, const String& stamp){
+  String path = makePath(toPeople, stamp);
+  File f = SD_MMC.open(path, FILE_WRITE);
+  if(!f) return false;
+  size_t w = f.write(buf, len);
+  f.close();
+  return (w==len);
+}
+
+// =========================
+// /src/vision/frame_diff.h
+// =========================
+#pragma once
+#include <Arduino.h>
+
+struct DiffResult { float energy=0; bool motion=false; };
+
+class FrameDiff {
+public:
+  DiffResult analyze(uint32_t dt_ms, float thresh);
+};
+
+// =========================
+// /src/vision/frame_diff.cpp
+// =========================
+#include "frame_diff.h"
+#include "app_config.h"
+#include <esp_camera.h>
+
+static camera_fb_t* snap(){ return esp_camera_fb_get(); }
+static void release(camera_fb_t* fb){ if(fb) esp_camera_fb_return(fb); }
+
+DiffResult FrameDiff::analyze(uint32_t dt_ms, float thresh){
+  DiffResult r; r.energy=0; r.motion=false;
+  camera_fb_t* a = snap(); if(!a) return r;
+  delay(dt_ms);
+  camera_fb_t* b = snap(); if(!b){ release(a); return r; }
+  // Простейшая разница по подвыборке байтов
+  size_t step = max<size_t>(1, a->len/2000); // 2k выборок
+  size_t n=0; uint32_t e=0;
+  for(size_t i=0; i<a->len && i<b->len; i+=step){ e += abs((int)a->buf[i] - (int)b->buf[i]); ++n; }
+  release(a); release(b);
+  if(n){ r.energy = (float)e / (float)n; r.motion = (r.energy >= thresh); }
+  return r;
+}
+
+// =========================
+// /src/vision/face_detect.h
+// =========================
+#pragma once
+#include <Arduino.h>
+#include <esp_camera.h>
+
+namespace FACE {
+  bool begin();
+  bool detect(const camera_fb_t* fb); // true если найдено лицо
+}
+
+// =========================
+// /src/vision/face_detect.cpp
+// =========================
+#include "face_detect.h"
+
+bool FACE::begin(){
+  // TODO: инициализация моделей ESP-WHO/esp-face при наличии; заглушка
+  return true;
+}
+
+bool FACE::detect(const camera_fb_t* fb){
+  // TODO: подключить реальную детекцию; временно всегда false
+  (void)fb; return false;
+}
+
+// =========================
+// /src/control/motion.h
+// =========================
+#pragma once
+#include <Arduino.h>
+#include "types.h"
+#include "hw/motors.h"
+
+class MotionCtl {
+public:
+  void begin(Motors* m){ m_ = m; }
+  void stop(){ m_->setMode(MotionMode::STOP); }
+  void fwd(uint8_t s){ m_->setMode(MotionMode::FWD, s); }
+  void back(uint8_t s){ m_->setMode(MotionMode::BACK, s); }
+  void turnL(uint8_t s){ m_->setMode(MotionMode::TURN_LEFT, s); }
+  void turnR(uint8_t s){ m_->setMode(MotionMode::TURN_RIGHT, s); }
+  MotionMode mode() const { return m_->mode(); }
+private:
+  Motors* m_ = nullptr;
+};
+
+// =========================
+// /src/control/motion.cpp
+// =========================
+#include "motion.h"
+// всё в header для простоты
+
+// =========================
+// /src/control/wall_follow.h
+// =========================
+#pragma once
+#include <Arduino.h>
+#include "app_config.h"
+#include "control/motion.h"
+
+class WallFollow {
+public:
+  explicit WallFollow(MotionCtl* ctl): ctl_(ctl){}
+  void tick(float dR_cm){
+    float err = dR_cm - CFG::RIGHT_TARGET_CM;
+    if(isnan(err)) { ctl_->fwd(CFG::BASE_SPEED); return; }
+    // Простейший P-регулятор (можно добавить D)
+    float kP = 6.0f; // подберите
+    int bias = (int)(kP * err);
+    int base = CFG::BASE_SPEED;
+    int L = constrain(base - bias, 0, 255);
+    int R = constrain(base + bias, 0, 255);
+    // Имитация раздельного управления: переводим в поворот при сильной ошибке
+    if(abs(bias) > 60){ (bias>0) ? ctl_->turnR(CFG::TURN_SPEED) : ctl_->turnL(CFG::TURN_SPEED); }
+    else { // прямой ход с небольшим смещением
+      // Упрощённо: используем только базовый FWD, PWM делим поровну (моторный класс делает одинаковые колёса)
+      ctl_->fwd((uint8_t)((L+R)/2));
+    }
+  }
+private:
+  MotionCtl* ctl_;
+};
+
+// =========================
+// /src/tasks/tasks.h
+// =========================
+#pragma once
+#include <Arduino.h>
+#include "types.h"
+#include "hw/hcsr04.h"
+#include "control/motion.h"
+#include "vision/frame_diff.h"
+#include "vision/face_detect.h"
+#include "storage/sd_writer.h"
+#include "hw/led_flash.h"
+
+struct AppCtx {
+  // HW
+  HCSR04* front=nullptr; HCSR04* right=nullptr; 
+  MotionCtl* motion=nullptr; LedFlash* flash=nullptr;
+  // State
+  volatile State state = State::BOOT;
+  volatile Ranges ranges;
+  // Vision helpers
+  FrameDiff diff; 
+};
+
+void taskSensors(void* arg);
+void taskMotion(void* arg);
+void taskVision(void* arg);
+
+// =========================
+// /src/tasks/tasks.cpp
+// =========================
+#include "tasks.h"
+#include "app_config.h"
+#include "utils/logger.h"
+#include "control/wall_follow.h"
+#include <esp_camera.h>
+
+static AppCtx* C; // локальный указатель в модуле
+
+void taskSensors(void* arg){
+  C = (AppCtx*)arg;
+  for(;;){
+    Ranges r; r.dF_cm = C->front->read_cm(); r.dR_cm = C->right->read_cm(); r.ts_ms = millis();
+    C->ranges = r;
+    vTaskDelay(pdMS_TO_TICKS(80));
+  }
+}
+
+static bool almostNoProgress(const Ranges& r0, const Ranges& r1){
+  if(isnan(r0.dF_cm) || isnan(r1.dF_cm) || isnan(r0.dR_cm) || isnan(r1.dR_cm)) return false;
+  return (fabs(r0.dF_cm - r1.dF_cm) < CFG::ANTISLIP_EPS_CM) && (fabs(r0.dR_cm - r1.dR_cm) < CFG::ANTISLIP_EPS_CM);
+}
+
+void taskMotion(void* arg){
+  C = (AppCtx*)arg;
+  WallFollow wf(C->motion);
+  State st = State::BOOT;
+  for(;;){
+    switch(st){
+      case State::BOOT:
+        st = State::SCAN_BEFORE_MOVE; break;
+
+      case State::SCAN_BEFORE_MOVE: {
+        // Ничего не едем, даём визии сделать frame-diff
+        vTaskDelay(pdMS_TO_TICKS(100));
+        st = State::RANGE_AND_PLAN; break; }
+
+      case State::RANGE_AND_PLAN: {
+        auto rr = C->ranges;
+        if(!isnan(rr.dF_cm) && rr.dF_cm < CFG::FRONT_STOP_CM){
+          // препятствие: небольшой поворот влево
+          C->motion->turnL(CFG::TURN_SPEED); vTaskDelay(pdMS_TO_TICKS(300)); C->motion->stop();
+          st = State::SCAN_BEFORE_MOVE; break;
+        }
+        st = State::MOVE_SEGMENT; break; }
+
+      case State::MOVE_SEGMENT: {
+        auto r0 = C->ranges; uint32_t t0 = millis();
+        uint32_t deadline = t0 + CFG::MOVE_SEG_MS;
+        for(;;){
+          wf.tick(C->ranges.dR_cm); // поддерживаем правую стену
+          vTaskDelay(pdMS_TO_TICKS(60));
+          if(millis() >= deadline) break;
+          if(C->ranges.dF_cm < CFG::FRONT_STOP_CM) break;
+        }
+        C->motion->stop();
+        // Антибукс проверка
+        auto r1 = C->ranges;
+        if(almostNoProgress(r0, r1)) st = State::ANTI_SLIP; else st = State::SCAN_AFTER_MOVE;
+        break; }
+
+      case State::SCAN_AFTER_MOVE:
+        vTaskDelay(pdMS_TO_TICKS(80));
+        st = State::SCAN_BEFORE_MOVE; break;
+
+      case State::ANTI_SLIP: {
+        C->motion->back(CFG::BACK_SPEED); vTaskDelay(pdMS_TO_TICKS(CFG::ANTISLIP_BACK_MS));
+        C->motion->turnL(CFG::TURN_SPEED); vTaskDelay(pdMS_TO_TICKS(CFG::ANTISLIP_TURN_MS));
+        C->motion->stop();
+        st = State::SCAN_BEFORE_MOVE; break; }
+
+      case State::PHOTO: {
+        // Обработка фото выполняется в taskVision; здесь только ожидание завершения и возврат
+        st = State::SCAN_BEFORE_MOVE; break; }
+    }
+    C->state = st;
+  }
+}
+
+void taskVision(void* arg){
+  C = (AppCtx*)arg;
+  for(;;){
+    if(C->state==State::SCAN_BEFORE_MOVE || C->state==State::SCAN_AFTER_MOVE){
+      // Разница кадров
+      auto diff = C->diff.analyze(CFG::FRAME_DIFF_DT_MS, CFG::FRAME_DIFF_THRESH);
+      if(diff.motion){
+        // При движении — проверяем лицо (можно сделать двухступенчато)
+        camera_fb_t* fb = esp_camera_fb_get();
+        if(fb){
+          bool face = FACE::detect(fb);
+          esp_camera_fb_return(fb);
+          if(face){
+            // Сделать кадр заново для сохранения
+            C->state = State::PHOTO; // сигнализируем motion FSM
+            vTaskDelay(pdMS_TO_TICKS(10));
+            // Остановить моторы на время фото — через явный вызов не управляем, FSM уже в STOP в этом состоянии
+            // Вспышка + SD
+            // NOTE: Реальную инициализацию SD/камеры и сохранение лучше вынести в отдельный taskStorage
+          }
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// =========================
+// /src/main.cpp
+// =========================
+#include <Arduino.h>
+#include <esp_camera.h>
+#include "pins.h"
+#include "app_config.h"
+#include "types.h"
+#include "utils/logger.h"
+#include "hw/hcsr04.h"
+#include "hw/motors.h"
+#include "hw/led_flash.h"
+#include "control/motion.h"
+#include "tasks/tasks.h"
+
+static HCSR04 front(PINS::HCSR04F_TRIG, PINS::HCSR04F_ECHO);
+static HCSR04 right (PINS::HCSR04R_TRIG, PINS::HCSR04R_ECHO);
+static Motors  motors;
+static LedFlash flash(PINS::LED_FLASH);
+static MotionCtl motion;
+static AppCtx ctx;
+
+static void camera_init_basic(){
+  camera_config_t config = {};
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0 = 5;  config.pin_d1 = 18; config.pin_d2 = 19; config.pin_d3 = 21;
+  config.pin_d4 = 36; config.pin_d5 = 39; config.pin_d6 = 34; config.pin_d7 = 35;
+  config.pin_xclk = 0; config.pin_pclk = 22; config.pin_vsync = 25; config.pin_href = 23;
+  config.pin_sccb_sda = 26; config.pin_sccb_scl = 27; config.pin_pwdn  = 32; config.pin_reset = -1;
+  config.xclk_freq_hz = 20000000; config.pixel_format = PIXFORMAT_JPEG;
+  if(psramFound()){ config.frame_size = FRAMESIZE_SVGA; config.jpeg_quality = 12; config.fb_count = 2; }
+  else { config.frame_size = FRAMESIZE_VGA;  config.jpeg_quality = 15; config.fb_count = 1; }
+  esp_err_t err = esp_camera_init(&config);
+  if(err != ESP_OK){ LOG::err("Camera init failed"); } else { LOG::info("Camera OK"); }
+}
+
+void setup(){
+  Serial.begin(115200); delay(200);
+  LOG::info("Boot");
+
+  front.begin(); right.begin();
+
+  motors.begin(PINS::ML_IN1, PINS::ML_IN2, PINS::MR_IN1, PINS::MR_IN2);
+  motion.begin(&motors);
+  flash.begin();
+
+  camera_init_basic();
+
+  ctx.front=&front; ctx.right=&right; ctx.motion=&motion; ctx.flash=&flash; ctx.state=State::BOOT;
+
+  // FreeRTOS задачи
+  xTaskCreatePinnedToCore(taskSensors, "sensors", 4096, &ctx, 1, nullptr, 1);
+  xTaskCreatePinnedToCore(taskMotion , "motion",  4096, &ctx, 1, nullptr, 1);
+  xTaskCreatePinnedToCore(taskVision , "vision",  6144, &ctx, 1, nullptr, 0);
+}
+
+void loop(){
+  // пусто — вся логика в задачах
+  static uint32_t last=0; if(millis()-last>1000){ last=millis();
+    auto r=ctx.ranges; Serial.printf("dF=%.1f dR=%.1f state=%d\n", r.dF_cm, r.dR_cm, (int)ctx.state);
+  }
+  delay(10);
+}
